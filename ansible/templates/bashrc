@@ -1,0 +1,4 @@
+source <(kubectl completion bash)
+alias k=kubectl
+alias c=clear
+complete -F __start_kubectl k

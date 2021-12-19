@@ -1,0 +1,167 @@
+---
+
+- name: Configure Common Elements
+  hosts: all
+  tasks:
+    - name: Update all packages
+      apt:
+        upgrade: dist
+        update_cache: yes
+        cache_valid_time: 3600 
+    - name: Remove packages
+      apt:
+        name:
+          - docker.io
+          - containerd
+          - kubelet
+          - kubeadm
+          - kubectl
+          - kubernetes-cni
+        state: absent
+        autoremove: yes
+      when: kubernetes_clean_up is defined and kubernetes_clean_up
+    - name: Install Ansible dependencies
+      apt:
+        name:
+          - python3-apt
+        state: latest
+    - name: Add APT GPG Keys
+      apt_key:
+        url: "{{ item }}"
+      loop:
+        - https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        - https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/xUbuntu_20.04/Release.key
+        - https://falco.org/repo/falcosecurity-3672BA8F.asc
+        - https://gvisor.dev/archive.key
+    - name: Add Repos
+      apt_repository:
+        repo:  "{{ item }}"
+        update_cache: yes
+      loop:
+        - deb http://apt.kubernetes.io/ kubernetes-xenial main
+        - deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_20.04/ /
+        - deb https://download.falco.org/packages/deb stable main
+        - deb https://storage.googleapis.com/gvisor/releases release main
+    - name: Install common packages
+      apt:
+        name:
+          - bash-completion
+          - binutils
+          - docker.io
+          - containerd
+          - kubelet=1.22.2-00
+          - kubeadm=1.22.2-00
+          - kubectl=1.22.2-00
+          - kubernetes-cni
+          - software-properties-common
+          - jq
+          - podman
+          - containers-common
+          - falco=0.26.1
+          - "linux-headers-{{ ansible_facts.kernel }}"
+          - runsc
+      notify:
+        - Enable/Start falco
+    - name: Prevent Package Upgrades on Pinned Packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+        - falco
+    - name: Create Necessary Directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/containerd
+        - /etc/containers
+        - /root/.kube
+    - name: Copy Common Files
+      template:
+        src: "{{ item }}"
+        dest: "/{{ item }}"
+      loop:
+        - etc/containerd/config.toml
+        - etc/containers/registries.conf
+        - etc/crictl.yaml
+        - etc/modules-load.d/containerd.conf
+        - etc/sysctl.d/99-kubernetes-cri.conf
+        - etc/default/kubelet
+        - etc/netplan/99-k8s-masq-fix.yaml
+      notify:
+        - Reload Systemd
+        - Enable/Start containerd
+        - Enable/Start kubelet
+        - Netplan Apply
+    - name: Disable SWAP (1/2)
+      shell:
+        cmd: swapoff -a && touch /root/.swap_disabled
+        creates: /root/.swap_disabled
+    - name: Disable SWAP (2/2)
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+    - name: Clean Up
+      shell: |
+        kubeadm reset -f
+        crictl rm $(crictl ps -a -q)
+      when: kubernetes_clean_up is defined and kubernetes_clean_up
+  handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: true
+    - name: Enable/Start containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+    - name: Enable/Start kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+    - name: Enable/Start falco
+      systemd:
+        name: falco
+        state: restarted
+        enabled: yes
+    - name: Netplan Apply
+      shell: |
+        netplan apply
+
+
+- name: kubeadm Controller
+  hosts: controllers
+  vars:
+    manifest_base_url: https://raw.githubusercontent.com/killer-sh/cks-course-environment/master/course-content
+  tasks:
+    - name: Install Controller
+      shell:
+        cmd: kubeadm init --kubernetes-version=1.22.2 --ignore-preflight-errors=NumCPU,Mem --skip-token-print --apiserver-advertise-address {{ ansible_facts.eth1.ipv4.address }}  && touch /root/.kubeadm_init_complete
+        creates: /root/.kubeadm_init_complete
+    - name: Copy kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+    - name: Install CNI
+      shell:
+        cmd: kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')" && touch /root/.cni_installed
+        creates: /root/.cni_installed
+    - name: Install Pre-Made Manifests (Dashboard, Ingress Controller, etc.)
+      shell:
+        cmd: "{{ item }}"
+        creates: /root/.manifests_installed
+      loop:
+        - "kubectl apply -f {{ manifest_base_url }}/cluster-setup/secure-ingress/nginx-ingress-controller.yaml"
+        - "kubectl apply -f {{ manifest_base_url }}/opa/gatekeeper.yaml"
+        - "kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.1.0/aio/deploy/recommended.yaml"
+    - name: "Idempotency - Manifests successfully installed"
+      file:
+        path: /root/.manifests_installed
+        state: touch

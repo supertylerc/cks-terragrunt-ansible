@@ -1,0 +1,7 @@
+{%- set prefix = ansible_facts.eth1.ipv4.address + "/" + ansible_facts.eth1.ipv4.netmask -%}
+network:
+  ethernets:
+    eth1:
+      routes:
+        - to: 10.96.0.0/12
+          via: {{ prefix | ipaddr(1) | ipaddr('address') }}
